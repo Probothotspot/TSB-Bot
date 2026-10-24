@@ -100,26 +100,7 @@ do
 		})
 	end
 end
-if type(external.keypress) == "function" and type(external.keyrelease) == "function" then
-	local press, release = external.keypress, external.keyrelease
-	table.insert(keyboard.backends, {
-		name = "executor keypress/keyrelease", kind = "native",
-		send = function(slot: number, down: boolean)
-			if down then press(0x30 + slot) else release(0x30 + slot) end
-		end,
-	})
-end
-do
-	local ok, virtualInput = pcall(function() return Input:CreateVirtualInput() end)
-	if ok and virtualInput then
-		table.insert(keyboard.backends, {
-			name = "Roblox VirtualInput", kind = "engine",
-			send = function(slot: number, down: boolean)
-				virtualInput:SendKey(down, keyboard.keys[slot], false)
-			end,
-		})
-	end
-end
+-- VirtualInputManager is the only skill-key backend: confirmed in the user's v0.7 report.
 if #keyboard.backends > 0 then
 	skillBackend = keyboard.backends[1].name
 	sendSkillKey = function(slot: number, down: boolean)
@@ -372,7 +353,7 @@ end
 local function fighterReport(): string
 	local snapshot = sampleFighter()
 	local lines = {
-		"TSB Bot fighter report v0.7.0",
+		"TSB Bot fighter report v0.7.1",
 		"PlaceId: " .. tostring(game.PlaceId),
 		"Status: " .. snapshot.status,
 		"Active ID: " .. cleanText(snapshot.activeId or "unknown"),
@@ -735,16 +716,9 @@ local function stepCombat(own: Rig, target: Rig, now: number, distance: number):
 			keyboard.lastError = candidate.name .. ": no numeric InputBegan within " .. tostring(Config.KeyReceiptTimeout) .. "s"
 			table.insert(keyboard.errors, keyboard.lastError)
 			keyboard.pending = nil
-			local remaining = false
-			for _, available in keyboard.backends do if not available.failed then remaining = true end end
-			if remaining then
-				combat.due = now + 0.08
-				combat.status = "Пробуем другой ввод клавиш"
-			else
-				combat.enabled = false
-				cancelCombat("Roblox не получил кнопки 1–4")
-				notify("Roblox did not receive numeric keys. Skill mode stopped; F7: keyboard diagnostics.")
-			end
+			combat.enabled = false
+			cancelCombat("Roblox не получил кнопки 1–4")
+			notify("VirtualInputManager did not deliver numeric keys. Skill mode stopped; F7: diagnostics.")
 		end
 		return true
 	end
@@ -870,7 +844,7 @@ local function createUI()
 		object.Parent = panel
 		return object
 	end
-	local header = label("Header", "TSB BOT  /  v0.7", 0, 36, 15, false)
+	local header = label("Header", "TSB BOT  /  v0.7.1", 0, 36, 15, false)
 	header.Size = UDim2.new(1, -64, 0, 36)
 	header.Active = true
 	ui.fighterLabel = label("Fighter", "Боец: определяем...", 44, 26, 15, false)
@@ -1156,5 +1130,5 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 		warn("[TSB Bot] GUI stopped; keyboard controls remain available: " .. tostring(reason))
 	end
 end))
-notify("Loaded v0.7: numeric input receipts and keyboard fallback enabled. F6: pause; End: unload.")
+notify("Loaded v0.7.1: skill keys use VirtualInputManager only. F6: pause; End: unload.")
 
