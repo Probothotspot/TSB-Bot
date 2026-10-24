@@ -86,6 +86,25 @@ local state = {
 local connections: { RBXScriptConnection } = {}
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
+local ui: { [string]: any } = { connections = {}, root = nil, panel = nil, dragging = false, x = 16, y = 90 }
+
+local function destroyUI()
+	for _, connection in ui.connections do connection:Disconnect() end
+	table.clear(ui.connections)
+	if ui.root then ui.root:Destroy() end
+	ui.root, ui.panel = nil, nil
+	ui.dragging = false
+end
+
+local function pointerOverUI(): boolean
+	if not ui.panel or not ui.root or not ui.root.Parent or not ui.root.Enabled then return false end
+	if ui.dragging then return true end
+	local position = Input:GetMouseLocation()
+	for _, object in ui.root.Parent:GetGuiObjectsAtPosition(position.X, position.Y) do
+		if object == ui.panel or object:IsDescendantOf(ui.panel) then return true end
+	end
+	return false
+end
 
 -- Identity comes from replicated data, never the avatar's name/appearance.
 -- Attribute names are candidates, not a verified contract with the current TSB build.
@@ -197,7 +216,7 @@ end
 local function fighterReport(): string
 	local snapshot = sampleFighter()
 	local lines = {
-		"TSB Bot fighter report v0.2.0",
+		"TSB Bot fighter report v0.3.0",
 		"PlaceId: " .. tostring(game.PlaceId),
 		"Status: " .. snapshot.status,
 		"Active ID: " .. cleanText(snapshot.activeId or "unknown"),
@@ -280,10 +299,197 @@ function controller.Destroy()
 	RunService:UnbindFromRenderStep(bindName)
 	for _, connection in connections do connection:Disconnect() end
 	table.clear(connections)
+	destroyUI()
 	suspend()
 	-- A transient backend error gets one immediate retry during unload.
 	if state.held then releaseMouse() end
 	if registry[registryKey] == controller then registry[registryKey] = nil end
+end
+
+local function toggleBot()
+	if state.destroyed then return end
+	if state.enabled then
+		pause("Paused.")
+	elseif not sendButton then
+		notify("No mouse-input backend. Requires mouse1press/release or Roblox VirtualInput.")
+	elseif state.held and not releaseMouse() then
+		notify("Release LMB manually before enabling; input backend is failing.")
+	else
+		state.focused = true
+		state.enabled = true
+		state.nextClick = 0
+		notify("Enabled. F6: pause; End: unload.")
+	end
+end
+
+local function showReport()
+	local ok, report = pcall(fighterReport)
+	if not ok then
+		notify("Fighter report failed: " .. tostring(report))
+		return
+	end
+	print(report)
+	local copied = false
+	if type(external.setclipboard) == "function" then
+		copied = pcall(external.setclipboard, report)
+	end
+	notify(if copied then "Fighter report copied and printed." else "Fighter report printed to console.")
+end
+
+local function layoutUI()
+	local available = ui.container.AbsoluteSize
+	if available.X <= 0 or available.Y <= 0 then return end
+	local scale = math.max(0.1, math.min(1, (available.X - 24) / 292, (available.Y - 24) / 252))
+	ui.scale.Scale = scale
+	ui.x = math.clamp(ui.x, 8, math.max(8, available.X - 292 * scale - 8))
+	ui.y = math.clamp(ui.y, 8, math.max(8, available.Y - 252 * scale - 8))
+	ui.panel.Position = UDim2.fromOffset(ui.x, ui.y)
+end
+
+local function createUI()
+	local parent = player:FindFirstChildOfClass("PlayerGui")
+	if not parent then return end
+	destroyUI()
+	local screen = Instance.new("ScreenGui")
+	ui.root = screen
+	screen.Name = registryKey .. "_GUI"
+	screen.ResetOnSpawn = false
+	screen.IgnoreGuiInset = false
+	screen.DisplayOrder = 100
+	screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	local container = Instance.new("Frame")
+	container.Name = "SafeArea"
+	container.Size = UDim2.fromScale(1, 1)
+	container.BackgroundTransparency = 1
+	container.BorderSizePixel = 0
+	container.Parent = screen
+	ui.container = container
+	local panel = Instance.new("Frame")
+	ui.panel = panel
+	panel.Name = "Panel"
+	panel.Size = UDim2.fromOffset(292, 252)
+	panel.Position = UDim2.fromOffset(ui.x, ui.y)
+	panel.BackgroundColor3 = Color3.fromRGB(18, 22, 30)
+	panel.BorderSizePixel = 0
+	panel.Active = true
+	panel.Parent = container
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = panel
+	local border = Instance.new("UIStroke")
+	border.Color = Color3.fromRGB(50, 62, 81)
+	border.Thickness = 1
+	border.Parent = panel
+	local scale = Instance.new("UIScale")
+	scale.Parent = panel
+	ui.scale = scale
+	local function label(name: string, text: string, y: number, height: number, size: number, muted: boolean): TextLabel
+		local object = Instance.new("TextLabel")
+		object.Name = name
+		object.Text = text
+		object.Size = UDim2.new(1, -28, 0, height)
+		object.Position = UDim2.fromOffset(14, y)
+		object.BackgroundTransparency = 1
+		object.Font = Enum.Font.Gotham
+		object.TextSize = size
+		object.TextColor3 = if muted then Color3.fromRGB(161, 174, 193) else Color3.fromRGB(235, 240, 248)
+		object.TextXAlignment = Enum.TextXAlignment.Left
+		object.TextTruncate = Enum.TextTruncate.AtEnd
+		object.Parent = panel
+		return object
+	end
+	local header = label("Header", "TSB BOT  /  v0.3", 0, 36, 15, false)
+	header.Size = UDim2.new(1, -64, 0, 36)
+	header.Active = true
+	ui.fighterLabel = label("Fighter", "Боец: определяем...", 44, 26, 15, false)
+	ui.hintLabel = label("Hint", "Отчёт поможет проверить бойца", 72, 18, 12, true)
+	ui.statusLabel = label("Status", "На паузе", 98, 20, 13, false)
+	label("Shortcuts", "F6: запуск   F7: отчёт   End: выход", 230, 16, 11, true)
+	local function button(name: string, text: string, y: number): TextButton
+		local object = Instance.new("TextButton")
+		object.Name = name
+		object.Text = text
+		object.Size = UDim2.new(1, -24, 0, 44)
+		object.Position = UDim2.fromOffset(12, y)
+		object.BackgroundColor3 = Color3.fromRGB(41, 51, 68)
+		object.BorderSizePixel = 0
+		object.Font = Enum.Font.Gotham
+		object.TextSize = 14
+		object.TextColor3 = Color3.fromRGB(245, 248, 252)
+		object.Parent = panel
+		local rounded = Instance.new("UICorner")
+		rounded.CornerRadius = UDim.new(0, 7)
+		rounded.Parent = object
+		return object
+	end
+	ui.toggleButton = button("Toggle", "Включить бота", 126)
+	local reportButton = button("Report", "Отчёт о бойце [F7]", 178)
+	local close = button("Close", "X", 2)
+	close.Size = UDim2.fromOffset(36, 32)
+	close.Position = UDim2.new(1, -40, 0, 2)
+	local function connect(event: RBXScriptSignal, callback: (...any) -> ())
+		table.insert(ui.connections, event:Connect(callback))
+	end
+	connect(ui.toggleButton.Activated, toggleBot)
+	connect(reportButton.Activated, showReport)
+	connect(close.Activated, function() controller.Destroy(); notify("Unloaded.") end)
+	connect(header.InputBegan, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			ui.dragging = true
+			ui.dragPointer = input
+			ui.dragPosition = input.Position
+			ui.dragX, ui.dragY = ui.x, ui.y
+			suspend()
+		end
+	end)
+	connect(Input.InputChanged, function(input)
+		if not ui.dragging then return end
+		local touch = ui.dragPointer.UserInputType == Enum.UserInputType.Touch
+		if (touch and input ~= ui.dragPointer) or (not touch and input.UserInputType ~= Enum.UserInputType.MouseMovement) then return end
+		local delta = input.Position - ui.dragPosition
+		ui.x, ui.y = ui.dragX + delta.X, ui.dragY + delta.Y
+		layoutUI()
+	end)
+	connect(Input.InputEnded, function(input)
+		if input == ui.dragPointer or input.UserInputType == Enum.UserInputType.MouseButton1 then ui.dragging = false end
+	end)
+	screen.Parent = parent
+	layoutUI()
+end
+
+local function updateUI()
+	if not ui.root or not ui.root.Parent then createUI() end
+	if not ui.root or not ui.root.Parent then return end
+	layoutUI()
+	local snapshot = fighter.snapshot
+	if snapshot.status == "waiting_for_character" then
+		ui.fighterLabel.Text = "Боец: возрождение..."
+		ui.hintLabel.Text = "Ожидаем появления персонажа"
+	elseif snapshot.activeId then
+		ui.fighterLabel.Text = "Боец: " .. cleanText(snapshot.activeId)
+		ui.hintLabel.Text = "ID найден. Подробности в отчёте"
+	elseif snapshot.selectedId then
+		ui.fighterLabel.Text = "Выбран: " .. cleanText(snapshot.selectedId)
+		ui.hintLabel.Text = "Активный боец ещё не подтверждён"
+	else
+		ui.fighterLabel.Text = "Боец: не определён"
+		ui.hintLabel.Text = "Нажми «Отчёт» для проверки"
+	end
+	ui.toggleButton.Text = if state.enabled then "Пауза [F6]" else "Включить бота [F6]"
+	ui.toggleButton.BackgroundColor3 = if state.enabled then Color3.fromRGB(160, 61, 73) else Color3.fromRGB(35, 142, 102)
+	if not state.enabled then
+		ui.statusLabel.Text = "На паузе"
+	elseif not state.focused then
+		ui.statusLabel.Text = "Ожидаем возврата в игру"
+	elseif Input:GetFocusedTextBox() then
+		ui.statusLabel.Text = "Пауза: ввод текста"
+	elseif pointerOverUI() then
+		ui.statusLabel.Text = "Пауза: управление панелью"
+	elseif state.target then
+		ui.statusLabel.Text = "Цель: " .. cleanText(state.target.DisplayName or state.target.Name)
+	else
+		ui.statusLabel.Text = "Поиск противника"
+	end
 end
 
 local function targetRig(candidate: Player?, own: Rig, radius: number): Rig?
@@ -322,6 +528,10 @@ local function update()
 	end
 	if not state.enabled then return end
 	if not state.focused or Input:GetFocusedTextBox() or Input.OnScreenKeyboardVisible then
+		suspend()
+		return
+	end
+	if pointerOverUI() then
 		suspend()
 		return
 	end
@@ -382,6 +592,7 @@ end
 table.insert(connections, Input.WindowFocused:Connect(function() state.focused = true end))
 table.insert(connections, Input.WindowFocusReleased:Connect(function()
 	state.focused = false
+	ui.dragging = false
 	suspend()
 end))
 table.insert(connections, Input.TextBoxFocused:Connect(function() suspend() end))
@@ -394,32 +605,11 @@ table.insert(connections, Input.InputBegan:Connect(function(input, processed)
 	end
 	if processed or Input:GetFocusedTextBox() then return end
 	if input.KeyCode == Config.ReportKey then
-		local ok, report = pcall(fighterReport)
-		if not ok then
-			notify("Fighter report failed: " .. tostring(report))
-			return
-		end
-		print(report)
-		local copied = false
-		if type(external.setclipboard) == "function" then
-			copied = pcall(external.setclipboard, report)
-		end
-		notify(if copied then "Fighter report copied and printed." else "Fighter report printed to console.")
+		showReport()
 		return
 	end
 	if input.KeyCode == Config.ToggleKey then
-		if state.enabled then
-			pause("Paused.")
-		elseif not sendButton then
-			notify("No mouse-input backend. Requires mouse1press/release or Roblox VirtualInput.")
-		elseif state.held and not releaseMouse() then
-			notify("Release LMB manually before enabling; input backend is failing.")
-		else
-			state.focused = true
-			state.enabled = true
-			state.nextClick = 0
-			notify("Enabled. F6: pause; End: unload.")
-		end
+		toggleBot()
 	end
 end))
 
@@ -449,5 +639,17 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 		notify(summary)
 	end
 end))
-notify("Loaded v0.2, paused. F6: enable; F7: fighter report; End: unload. Input: " .. backend)
+local nextUIUpdate = 0
+local uiFailed = false
+table.insert(connections, RunService.Heartbeat:Connect(function()
+	if state.destroyed or uiFailed or os.clock() < nextUIUpdate then return end
+	nextUIUpdate = os.clock() + 0.1
+	local ok, reason = pcall(updateUI)
+	if not ok then
+		uiFailed = true
+		destroyUI()
+		warn("[TSB Bot] GUI stopped; keyboard controls remain available: " .. tostring(reason))
+	end
+end))
+notify("Loaded v0.3, paused. F6: enable; F7: fighter report; End: unload. Input: " .. backend)
 
