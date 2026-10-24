@@ -25,6 +25,7 @@ local Config = {
 	ComboRetryDelay = 0.9,
 	ComboWaitLimit = 0.9,
 	SkillKeyHold = 0.12,
+	KeyReceiptTimeout = 0.4,
 }
 
 local Players = game:GetService("Players")
@@ -83,20 +84,70 @@ end
 
 local sendSkillKey: ((number, boolean) -> ())? = nil
 local skillBackend = "unavailable"
+local keyboard: { [string]: any } = {
+	keys = { Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four },
+	backends = {}, current = nil, active = nil, pending = nil,
+	calls = 0, received = 0, errors = {}, lastError = "none", lastReceived = "none",
+}
+do
+	local ok, manager = pcall(function() return game:GetService("VirtualInputManager") end)
+	if ok and manager then
+		table.insert(keyboard.backends, {
+			name = "VirtualInputManager", kind = "engine",
+			send = function(slot: number, down: boolean)
+				manager:SendKeyEvent(down, keyboard.keys[slot], false, game)
+			end,
+		})
+	end
+end
 if type(external.keypress) == "function" and type(external.keyrelease) == "function" then
 	local press, release = external.keypress, external.keyrelease
-	sendSkillKey = function(slot: number, down: boolean)
-		if down then press(0x30 + slot) else release(0x30 + slot) end
-	end
-	skillBackend = "executor keypress/keyrelease"
-else
+	table.insert(keyboard.backends, {
+		name = "executor keypress/keyrelease", kind = "native",
+		send = function(slot: number, down: boolean)
+			if down then press(0x30 + slot) else release(0x30 + slot) end
+		end,
+	})
+end
+do
 	local ok, virtualInput = pcall(function() return Input:CreateVirtualInput() end)
 	if ok and virtualInput then
-		local keys = { Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four }
-		sendSkillKey = function(slot: number, down: boolean)
-			virtualInput:SendKey(down, keys[slot], false)
+		table.insert(keyboard.backends, {
+			name = "Roblox VirtualInput", kind = "engine",
+			send = function(slot: number, down: boolean)
+				virtualInput:SendKey(down, keyboard.keys[slot], false)
+			end,
+		})
+	end
+end
+if #keyboard.backends > 0 then
+	skillBackend = keyboard.backends[1].name
+	sendSkillKey = function(slot: number, down: boolean)
+		if not down then
+			local index = keyboard.active
+			if index then
+				keyboard.backends[index].send(slot, false)
+				keyboard.active = nil
+			end
+			return
 		end
-		skillBackend = "Roblox VirtualInput"
+		for index, candidate in keyboard.backends do
+			if candidate.failed then continue end
+			keyboard.current, keyboard.active = index, index
+			skillBackend = candidate.name
+			keyboard.calls += 1
+			local ok, reason = pcall(candidate.send, slot, true)
+			if ok then return end
+			local released, releaseError = pcall(candidate.send, slot, false)
+			candidate.failed = true
+			keyboard.lastError = candidate.name .. ": " .. tostring(reason)
+			table.insert(keyboard.errors, keyboard.lastError)
+			if not released and candidate.kind == "native" then
+				error(keyboard.lastError .. "; release failed: " .. tostring(releaseError))
+			end
+			keyboard.active = nil
+		end
+		error("No keyboard backend accepted the call: " .. table.concat(keyboard.errors, " | "))
 	end
 end
 
@@ -321,7 +372,7 @@ end
 local function fighterReport(): string
 	local snapshot = sampleFighter()
 	local lines = {
-		"TSB Bot fighter report v0.6.0",
+		"TSB Bot fighter report v0.7.0",
 		"PlaceId: " .. tostring(game.PlaceId),
 		"Status: " .. snapshot.status,
 		"Active ID: " .. cleanText(snapshot.activeId or "unknown"),
@@ -333,6 +384,11 @@ local function fighterReport(): string
 		"Current target: " .. cleanText(targetName(state.target)),
 		"M1 input: " .. backend,
 		"Skill input: " .. skillBackend,
+		"Keyboard send calls: " .. tostring(keyboard.calls),
+		"Numeric InputBegan receipts: " .. tostring(keyboard.received),
+		"Last numeric key received: " .. keyboard.lastReceived,
+		"Keyboard delivery error: " .. cleanText(keyboard.lastError),
+		"Keyboard backend failures: " .. cleanText(table.concat(keyboard.errors, " | ")),
 		"Combo enabled: " .. tostring(combat.enabled),
 		"Skill click confirmation: " .. tostring(combat.confirmClick),
 		"Combo state: " .. cleanText(combat.status),
@@ -420,6 +476,7 @@ local function cancelCombat(reason: string): boolean
 	end
 	combat.active, combat.plan, combat.target = false, nil, nil
 	combat.confirmAt, combat.waitUntil = nil, nil
+	keyboard.pending = nil
 	combat.index = 1
 	combat.nextStart = os.clock() + Config.ComboRetryDelay
 	combat.status = reason
@@ -465,6 +522,8 @@ function controller.GetCombatState()
 		index = combat.index, heldSlot = combat.heldSlot,
 		confirmClick = combat.confirmClick, keyAttempts = combat.keyAttempts,
 		lastAttempt = combat.lastAttempt, nextUse = table.clone(combat.nextUse),
+		keyReceipts = keyboard.received, keyboardCalls = keyboard.calls, keyboardError = keyboard.lastError,
+		keyboardBackend = skillBackend,
 		targetMode = state.targetMode, targetName = targetName(state.target),
 	}
 end
@@ -657,6 +716,38 @@ local function stepCombat(own: Rig, target: Rig, now: number, distance: number):
 		combat.status = "Подготовка: " .. chosen.name
 		return true
 	end
+	local pending = keyboard.pending
+	if pending then
+		if pending.echoed then
+			keyboard.lastError = "none"
+			local spec = saitama.skills[pending.name]
+			combat.nextUse[pending.name] = now + spec.retry
+			combat.index += 1
+			combat.due = now + pending.delay
+			combat.waitUntil = nil
+			combat.status = "Кнопка получена: " .. pending.name
+			keyboard.pending = nil
+			if combat.confirmClick then combat.confirmAt = math.max(now, combat.keyReleaseAt) + 0.04 end
+		elseif now >= pending.deadline then
+			if not releaseSkillKey() then pause("Keyboard release failed after missing input receipt."); return true end
+			local candidate = keyboard.backends[keyboard.current]
+			candidate.failed = true
+			keyboard.lastError = candidate.name .. ": no numeric InputBegan within " .. tostring(Config.KeyReceiptTimeout) .. "s"
+			table.insert(keyboard.errors, keyboard.lastError)
+			keyboard.pending = nil
+			local remaining = false
+			for _, available in keyboard.backends do if not available.failed then remaining = true end end
+			if remaining then
+				combat.due = now + 0.08
+				combat.status = "Пробуем другой ввод клавиш"
+			else
+				combat.enabled = false
+				cancelCombat("Roblox не получил кнопки 1–4")
+				notify("Roblox did not receive numeric keys. Skill mode stopped; F7: keyboard diagnostics.")
+			end
+		end
+		return true
+	end
 	if combat.confirmAt then
 		if distance > Config.AttackDistance then
 			cancelCombat("Цель ушла перед подтверждением")
@@ -697,6 +788,7 @@ local function stepCombat(own: Rig, target: Rig, now: number, distance: number):
 		local spec = saitama.skills[name]
 		combat.heldSlot = spec.slot
 		combat.keyReleaseAt = now + Config.SkillKeyHold
+		keyboard.pending = { slot = spec.slot, name = name, delay = action.delay, deadline = now + Config.KeyReceiptTimeout, echoed = false }
 		local ok, errorMessage = pcall(sender, spec.slot, true)
 		if not ok then
 			combat.enabled = false
@@ -707,9 +799,8 @@ local function stepCombat(own: Rig, target: Rig, now: number, distance: number):
 		end
 		combat.keyAttempts += 1
 		combat.lastAttempt = name .. " [" .. tostring(spec.slot) .. "]"
-		combat.nextUse[name] = now + spec.retry
-		combat.status = "Комбо: " .. name
-		if combat.confirmClick then combat.confirmAt = now + Config.SkillKeyHold + 0.04 end
+		combat.status = "Ждём кнопку " .. tostring(spec.slot) .. ": " .. name
+		return true
 	end
 	combat.waitUntil = nil
 	combat.index += 1
@@ -779,7 +870,7 @@ local function createUI()
 		object.Parent = panel
 		return object
 	end
-	local header = label("Header", "TSB BOT  /  v0.6", 0, 36, 15, false)
+	local header = label("Header", "TSB BOT  /  v0.7", 0, 36, 15, false)
 	header.Size = UDim2.new(1, -64, 0, 36)
 	header.Active = true
 	ui.fighterLabel = label("Fighter", "Боец: определяем...", 44, 26, 15, false)
@@ -855,7 +946,7 @@ local function updateUI()
 	elseif snapshot.activeId then
 		local displayName = if snapshot.activeId == "Bald" then "Сайтама" elseif snapshot.activeId == "Hunter" then "Гароу" else cleanText(snapshot.activeId)
 		ui.fighterLabel.Text = "Боец: " .. displayName
-		ui.hintLabel.Text = "Попыток умений: " .. tostring(combat.keyAttempts)
+		ui.hintLabel.Text = "Клавиш получено: " .. tostring(keyboard.received) .. " / попыток: " .. tostring(combat.keyAttempts)
 	elseif snapshot.selectedId then
 		ui.fighterLabel.Text = "Выбран: " .. cleanText(snapshot.selectedId)
 		ui.hintLabel.Text = "Активный боец ещё не подтверждён"
@@ -998,6 +1089,12 @@ table.insert(connections, Input.TextBoxFocused:Connect(function() suspend() end)
 table.insert(connections, player.CharacterRemoving:Connect(function() suspend() end))
 table.insert(connections, Input.InputBegan:Connect(function(input, processed)
 	state.focused = true
+	local pending = keyboard.pending
+	if pending and not pending.echoed and input.KeyCode == keyboard.keys[pending.slot] and os.clock() <= pending.deadline then
+		pending.echoed = true
+		keyboard.received += 1
+		keyboard.lastReceived = tostring(pending.slot) .. " via " .. skillBackend
+	end
 	if input.KeyCode == Config.UnloadKey and not Input:GetFocusedTextBox() then
 		controller.Destroy()
 		notify("Unloaded.")
@@ -1059,5 +1156,5 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 		warn("[TSB Bot] GUI stopped; keyboard controls remain available: " .. tostring(reason))
 	end
 end))
-notify("Loaded v0.6: bot, combos and skill clicks ON. Return to Roblox to start. F6: pause; End: unload.")
+notify("Loaded v0.7: numeric input receipts and keyboard fallback enabled. F6: pause; End: unload.")
 
