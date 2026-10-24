@@ -1,6 +1,6 @@
 --!strict
--- The Strongest Battlegrounds: nearest visible player, approach, M1 input.
--- F6: enable/pause. F7: fighter report. End: unload. Starts paused.
+-- The Strongest Battlegrounds: M1 and optional normal-form Saitama combos.
+-- F6: bot. F7: report. F8: combos. F9: skill click confirmation. End: unload.
 -- No downloaded code or game-specific remote payloads.
 
 local Config = {
@@ -14,7 +14,13 @@ local Config = {
 	ScanInterval = 0.2,
 	ToggleKey = Enum.KeyCode.F6,
 	ReportKey = Enum.KeyCode.F7,
+	ComboKey = Enum.KeyCode.F8,
+	ConfirmKey = Enum.KeyCode.F9,
 	UnloadKey = Enum.KeyCode.End,
+	ComboResetDelay = 1.1,
+	ComboRetryDelay = 0.9,
+	ComboWaitLimit = 0.9,
+	SkillKeyHold = 0.06,
 }
 
 local Players = game:GetService("Players")
@@ -70,6 +76,60 @@ else
 		backend = "Roblox VirtualInput"
 	end
 end
+
+local sendSkillKey: ((number, boolean) -> ())? = nil
+local skillBackend = "unavailable"
+if type(external.keypress) == "function" and type(external.keyrelease) == "function" then
+	local press, release = external.keypress, external.keyrelease
+	sendSkillKey = function(slot: number, down: boolean)
+		if down then press(0x30 + slot) else release(0x30 + slot) end
+	end
+	skillBackend = "executor keypress/keyrelease"
+else
+	local ok, virtualInput = pcall(function() return Input:CreateVirtualInput() end)
+	if ok and virtualInput then
+		local keys = { Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four }
+		sendSkillKey = function(slot: number, down: boolean)
+			virtualInput:SendKey(down, keys[slot], false)
+		end
+		skillBackend = "Roblox VirtualInput"
+	end
+end
+
+-- These are local retry limits and starter timings, not measured server cooldowns.
+local saitama = {
+	skills = {
+		["Normal Punch"] = { slot = 1, retry = 12, range = 6 },
+		["Consecutive Punches"] = { slot = 2, retry = 14, range = 5 },
+		["Shove"] = { slot = 3, retry = 12, range = 5 },
+		["Uppercut"] = { slot = 4, retry = 14, range = 5 },
+	},
+	plans = {
+		{
+			name = "3M1 > 2 > 4 > 1",
+			steps = {
+				{ kind = "m1", delay = 0.48 }, { kind = "m1", delay = 0.48 }, { kind = "m1", delay = 0.48 },
+				{ kind = "skill", skill = "Consecutive Punches", delay = 1.9 },
+				{ kind = "skill", skill = "Uppercut", delay = 0.95 },
+				{ kind = "skill", skill = "Normal Punch", delay = 1.0 },
+			},
+		},
+		{
+			name = "3M1 > 3 > 1",
+			steps = {
+				{ kind = "m1", delay = 0.48 }, { kind = "m1", delay = 0.48 }, { kind = "m1", delay = 0.48 },
+				{ kind = "skill", skill = "Shove", delay = 0.65 },
+				{ kind = "skill", skill = "Normal Punch", delay = 1.0 },
+			},
+		},
+	},
+}
+local combat: { [string]: any } = {
+	enabled = false, confirmClick = false, active = false, owner = nil, target = nil,
+	plan = nil, index = 1, due = 0, nextStart = 0, routeCursor = 1,
+	heldSlot = nil, keyReleaseAt = 0, confirmAt = nil, waitUntil = nil,
+	nextUse = {}, status = "M1", lastAttempt = "none", keyAttempts = 0,
+}
 
 type Rig = { model: Model, human: Humanoid, root: BasePart }
 local state = {
@@ -216,12 +276,19 @@ end
 local function fighterReport(): string
 	local snapshot = sampleFighter()
 	local lines = {
-		"TSB Bot fighter report v0.3.0",
+		"TSB Bot fighter report v0.4.0",
 		"PlaceId: " .. tostring(game.PlaceId),
 		"Status: " .. snapshot.status,
 		"Active ID: " .. cleanText(snapshot.activeId or "unknown"),
 		"Selected ID: " .. cleanText(snapshot.selectedId or "unknown"),
 		"Source: " .. (snapshot.source or "none"),
+		"M1 input: " .. backend,
+		"Skill input: " .. skillBackend,
+		"Combo enabled: " .. tostring(combat.enabled),
+		"Skill click confirmation: " .. tostring(combat.confirmClick),
+		"Combo state: " .. cleanText(combat.status),
+		"Last skill input attempt: " .. cleanText(combat.lastAttempt),
+		"Skill input attempts: " .. tostring(combat.keyAttempts),
 		"Tool names (not slot bindings): " .. cleanText(table.concat(snapshot.abilities, " | ")),
 	}
 	local function appendAttributes(label: string, attributes: { [string]: any })
@@ -236,6 +303,17 @@ local function fighterReport(): string
 	end
 	appendAttributes("Player attributes", snapshot.playerAttributes)
 	appendAttributes("Character attributes", snapshot.characterAttributes)
+	local function appendTools(container: Instance?)
+		if not container then return end
+		for _, object in container:GetChildren() do
+			if object:IsA("Tool") then
+				table.insert(lines, "Tool: " .. cleanText(object.Name) .. "; Enabled=" .. tostring(object.Enabled))
+				appendAttributes("  Attributes", object:GetAttributes())
+			end
+		end
+	end
+	appendTools(player:FindFirstChildOfClass("Backpack"))
+	appendTools(player.Character)
 	return table.concat(lines, "\n")
 end
 
@@ -261,6 +339,31 @@ local function releaseMouse(): boolean
 	return true
 end
 
+local function releaseSkillKey(): boolean
+	local slot = combat.heldSlot
+	if not slot then return true end
+	local sender = sendSkillKey
+	if not sender then return false end
+	local ok, reason = pcall(sender, slot, false)
+	if not ok then
+		warn("[TSB Bot] Skill key release failed; press/release " .. tostring(slot) .. " manually: " .. tostring(reason))
+		return false
+	end
+	combat.heldSlot = nil
+	return true
+end
+
+local function cancelCombat(reason: string): boolean
+	local released = releaseSkillKey()
+	if combat.active then releaseMouse() end
+	combat.active, combat.plan, combat.target = false, nil, nil
+	combat.confirmAt, combat.waitUntil = nil, nil
+	combat.index = 1
+	combat.nextStart = os.clock() + Config.ComboRetryDelay
+	combat.status = reason
+	return released
+end
+
 local function stopMovement()
 	local human = state.drivenHuman
 	state.drivenHuman = nil
@@ -272,6 +375,7 @@ end
 local function suspend()
 	state.target = nil
 	state.nextScan = 0
+	cancelCombat("Ожидание")
 	releaseMouse()
 	stopMovement()
 end
@@ -292,6 +396,15 @@ function controller.GetFighterState(): FighterSnapshot
 	return result
 end
 
+function controller.GetCombatState()
+	return {
+		enabled = combat.enabled, active = combat.active, status = combat.status,
+		index = combat.index, heldSlot = combat.heldSlot,
+		confirmClick = combat.confirmClick, keyAttempts = combat.keyAttempts,
+		lastAttempt = combat.lastAttempt, nextUse = table.clone(combat.nextUse),
+	}
+end
+
 function controller.Destroy()
 	if state.destroyed then return end
 	state.destroyed = true
@@ -303,6 +416,7 @@ function controller.Destroy()
 	suspend()
 	-- A transient backend error gets one immediate retry during unload.
 	if state.held then releaseMouse() end
+	if combat.heldSlot then releaseSkillKey() end
 	if registry[registryKey] == controller then registry[registryKey] = nil end
 end
 
@@ -314,12 +428,37 @@ local function toggleBot()
 		notify("No mouse-input backend. Requires mouse1press/release or Roblox VirtualInput.")
 	elseif state.held and not releaseMouse() then
 		notify("Release LMB manually before enabling; input backend is failing.")
+	elseif combat.heldSlot and not releaseSkillKey() then
+		notify("Release the skill key manually before enabling; input backend is failing.")
 	else
 		state.focused = true
 		state.enabled = true
 		state.nextClick = 0
 		notify("Enabled. F6: pause; End: unload.")
 	end
+end
+
+local function toggleCombos()
+	if combat.enabled then
+		combat.enabled = false
+		if not cancelCombat("M1") then pause("Skill key release failed; release it manually.") end
+		notify("Saitama combos disabled. M1 mode.")
+	elseif not sendSkillKey then
+		notify("Skill keyboard input unavailable. M1 remains available; F7: report.")
+	else
+		combat.enabled = true
+		cancelCombat("Комбо готовы")
+		notify("Saitama combos enabled for Bald with the normal kit. F8: disable.")
+	end
+end
+
+local function toggleConfirmation()
+	if not cancelCombat("Режим активации изменён") then
+		pause("Skill key release failed; release it manually.")
+		return
+	end
+	combat.confirmClick = not combat.confirmClick
+	notify(if combat.confirmClick then "Skill activation: number key, then LMB." else "Skill activation: number key only. Use Auto Activate in game.")
 end
 
 local function showReport()
@@ -336,13 +475,174 @@ local function showReport()
 	notify(if copied then "Fighter report copied and printed." else "Fighter report printed to console.")
 end
 
+local function pressM1(now: number): boolean
+	if state.held or now < state.nextClick then return false end
+	local sender = sendButton
+	if not sender then pause("No mouse-input backend."); return false end
+	state.held = true
+	local ok, reason = pcall(sender, true)
+	if not ok then pause("Input rejected: " .. tostring(reason)); return false end
+	state.releaseAt = now + Config.ClickHold
+	state.nextClick = now + Config.ClickInterval
+	return true
+end
+
+local function defaultSkillBindings(): boolean
+	local attributes = player:GetAttributes()
+	for _, key in { "HotbarLayout", "BarLayout" } do
+		local value = attributes[key]
+		if type(value) == "string" then
+			local compact = value:gsub("%s", "")
+			if compact ~= "" and compact ~= "{}" and compact ~= "[]" then return false end
+		elseif type(value) == "table" and next(value) ~= nil then
+			return false
+		end
+	end
+	return true
+end
+
+local function skillTools(model: Model): { [string]: any }
+	local tools: { [string]: any } = {}
+	local function collect(container: Instance?)
+		if not container then return end
+		for _, child in container:GetChildren() do
+			if child:IsA("Tool") then tools[child.Name] = child end
+		end
+	end
+	collect(player:FindFirstChildOfClass("Backpack"))
+	collect(model)
+	return tools
+end
+
+local function waitCombat(now: number, reason: string): boolean
+	if not combat.waitUntil then combat.waitUntil = now + Config.ComboWaitLimit end
+	if now >= combat.waitUntil then
+		cancelCombat(reason)
+		return false
+	end
+	combat.status = reason
+	combat.due = now + 0.05
+	return true
+end
+
+local function stepCombat(own: Rig, target: Rig, now: number, distance: number): boolean
+	if not combat.enabled then return false end
+	if combat.owner ~= own.model then
+		cancelCombat("Новый персонаж")
+		combat.owner = own.model
+		combat.nextUse = {}
+	end
+	local attributes = own.model:GetAttributes()
+	local tools = skillTools(own.model)
+	local readyKit = attributes.Character == "Bald" and attributes.LoadedCharacter ~= false and attributes.Ulted ~= true
+	for name in saitama.skills do if not tools[name] then readyKit = false end end
+	local reason: string? = nil
+	if not readyKit then reason = "M1: нужен обычный набор Сайтамы" end
+	if not defaultSkillBindings() then reason = "M1: нужны стандартные кнопки 1–4" end
+	if attributes.Stunned == true or attributes.Ragdolled == true or attributes.Ragdoll == true then
+		reason = "Комбо прервано: оглушение"
+	end
+	if reason then
+		if combat.active then cancelCombat(reason) else combat.status = reason end
+		return false
+	end
+	if combat.active and combat.target ~= target.model then
+		cancelCombat("Цель сменилась")
+		return true
+	end
+	if not combat.active then
+		if now < combat.nextStart or distance > Config.AttackDistance then return false end
+		local chosen = nil
+		for offset = 0, #saitama.plans - 1 do
+			local candidateIndex = (combat.routeCursor - 1 + offset) % #saitama.plans + 1
+			local candidate = saitama.plans[candidateIndex]
+			local available = true
+			for _, action in candidate.steps do
+				if action.kind == "skill" then
+					local name = action.skill
+					if (combat.nextUse[name] or 0) > now or tools[name].Enabled == false then available = false end
+				end
+			end
+			if available then
+				chosen = candidate
+				combat.routeCursor = candidateIndex % #saitama.plans + 1
+				break
+			end
+		end
+		if not chosen then combat.status = "M1: ожидание умений"; return false end
+		if not releaseMouse() then pause("Mouse release failed before combo."); return true end
+		combat.active, combat.plan, combat.target = true, chosen, target.model
+		combat.index, combat.due = 1, now + Config.ComboResetDelay
+		combat.waitUntil = nil
+		combat.status = "Подготовка: " .. chosen.name
+		return true
+	end
+	if combat.confirmAt then
+		if distance > Config.AttackDistance then
+			cancelCombat("Цель ушла перед подтверждением")
+			return true
+		end
+		if now >= combat.confirmAt then
+			if pressM1(now) then combat.confirmAt = nil end
+		end
+		return true
+	end
+	if now < combat.due or combat.heldSlot then return true end
+	local plan = combat.plan
+	local action = plan.steps[combat.index]
+	if not action then
+		cancelCombat("Последовательность завершена")
+		return false
+	end
+	local maxRange = if action.kind == "skill" then saitama.skills[action.skill].range else Config.AttackDistance
+	if distance > maxRange then return waitCombat(now, "Ожидание дистанции") end
+	if action.kind == "m1" then
+		if attributes.M1Ready == false then return waitCombat(now, "Ожидание M1") end
+		if not pressM1(now) then return true end
+		combat.status = "Комбо: M1 " .. tostring(combat.index) .. "/3"
+	else
+		local name = action.skill
+		local tool = tools[name]
+		if not tool or tool.Enabled == false or (combat.nextUse[name] or 0) > now then
+			return waitCombat(now, "Ожидание: " .. name)
+		end
+		if not releaseMouse() then pause("Mouse release failed before skill."); return true end
+		local sender = sendSkillKey
+		if not sender then
+			combat.enabled = false
+			cancelCombat("Нет ввода клавиш")
+			return false
+		end
+		local spec = saitama.skills[name]
+		combat.heldSlot = spec.slot
+		combat.keyReleaseAt = now + Config.SkillKeyHold
+		local ok, errorMessage = pcall(sender, spec.slot, true)
+		if not ok then
+			combat.enabled = false
+			local released = cancelCombat("Ошибка ввода умения")
+			notify("Skill input rejected: " .. tostring(errorMessage) .. ". F7: report.")
+			if not released then pause("Skill key release failed; release it manually.") end
+			return true
+		end
+		combat.keyAttempts += 1
+		combat.lastAttempt = name .. " [" .. tostring(spec.slot) .. "]"
+		combat.nextUse[name] = now + spec.retry
+		combat.status = "Комбо: " .. name
+		if combat.confirmClick then combat.confirmAt = now + Config.SkillKeyHold + 0.04 end
+	end
+	combat.waitUntil = nil
+	combat.index += 1
+	combat.due = now + action.delay
+	return true
+end
+
 local function layoutUI()
 	local available = ui.container.AbsoluteSize
 	if available.X <= 0 or available.Y <= 0 then return end
-	local scale = math.max(0.1, math.min(1, (available.X - 24) / 292, (available.Y - 24) / 252))
+	local scale = math.max(0.1, math.min(1, (available.X - 24) / 292, (available.Y - 24) / 356))
 	ui.scale.Scale = scale
 	ui.x = math.clamp(ui.x, 8, math.max(8, available.X - 292 * scale - 8))
-	ui.y = math.clamp(ui.y, 8, math.max(8, available.Y - 252 * scale - 8))
+	ui.y = math.clamp(ui.y, 8, math.max(8, available.Y - 356 * scale - 8))
 	ui.panel.Position = UDim2.fromOffset(ui.x, ui.y)
 end
 
@@ -367,7 +667,7 @@ local function createUI()
 	local panel = Instance.new("Frame")
 	ui.panel = panel
 	panel.Name = "Panel"
-	panel.Size = UDim2.fromOffset(292, 252)
+	panel.Size = UDim2.fromOffset(292, 356)
 	panel.Position = UDim2.fromOffset(ui.x, ui.y)
 	panel.BackgroundColor3 = Color3.fromRGB(18, 22, 30)
 	panel.BorderSizePixel = 0
@@ -398,13 +698,13 @@ local function createUI()
 		object.Parent = panel
 		return object
 	end
-	local header = label("Header", "TSB BOT  /  v0.3", 0, 36, 15, false)
+	local header = label("Header", "TSB BOT  /  v0.4", 0, 36, 15, false)
 	header.Size = UDim2.new(1, -64, 0, 36)
 	header.Active = true
 	ui.fighterLabel = label("Fighter", "Боец: определяем...", 44, 26, 15, false)
 	ui.hintLabel = label("Hint", "Отчёт поможет проверить бойца", 72, 18, 12, true)
 	ui.statusLabel = label("Status", "На паузе", 98, 20, 13, false)
-	label("Shortcuts", "F6: запуск   F7: отчёт   End: выход", 230, 16, 11, true)
+	label("Shortcuts", "F6: бот  F7: отчёт  F8: комбо  F9: ЛКМ", 334, 16, 10, true)
 	local function button(name: string, text: string, y: number): TextButton
 		local object = Instance.new("TextButton")
 		object.Name = name
@@ -423,7 +723,9 @@ local function createUI()
 		return object
 	end
 	ui.toggleButton = button("Toggle", "Включить бота", 126)
-	local reportButton = button("Report", "Отчёт о бойце [F7]", 178)
+	ui.comboButton = button("Combos", "Комбо Сайтамы: выкл [F8]", 178)
+	ui.confirmButton = button("Confirmation", "Умение: только клавиша [F9]", 230)
+	local reportButton = button("Report", "Отчёт о бойце [F7]", 282)
 	local close = button("Close", "X", 2)
 	close.Size = UDim2.fromOffset(36, 32)
 	close.Position = UDim2.new(1, -40, 0, 2)
@@ -431,6 +733,8 @@ local function createUI()
 		table.insert(ui.connections, event:Connect(callback))
 	end
 	connect(ui.toggleButton.Activated, toggleBot)
+	connect(ui.comboButton.Activated, toggleCombos)
+	connect(ui.confirmButton.Activated, toggleConfirmation)
 	connect(reportButton.Activated, showReport)
 	connect(close.Activated, function() controller.Destroy(); notify("Unloaded.") end)
 	connect(header.InputBegan, function(input)
@@ -466,7 +770,8 @@ local function updateUI()
 		ui.fighterLabel.Text = "Боец: возрождение..."
 		ui.hintLabel.Text = "Ожидаем появления персонажа"
 	elseif snapshot.activeId then
-		ui.fighterLabel.Text = "Боец: " .. cleanText(snapshot.activeId)
+		local displayName = if snapshot.activeId == "Bald" then "Сайтама" elseif snapshot.activeId == "Hunter" then "Гароу" else cleanText(snapshot.activeId)
+		ui.fighterLabel.Text = "Боец: " .. displayName
 		ui.hintLabel.Text = "ID найден. Подробности в отчёте"
 	elseif snapshot.selectedId then
 		ui.fighterLabel.Text = "Выбран: " .. cleanText(snapshot.selectedId)
@@ -477,6 +782,8 @@ local function updateUI()
 	end
 	ui.toggleButton.Text = if state.enabled then "Пауза [F6]" else "Включить бота [F6]"
 	ui.toggleButton.BackgroundColor3 = if state.enabled then Color3.fromRGB(160, 61, 73) else Color3.fromRGB(35, 142, 102)
+	ui.comboButton.Text = if combat.enabled then "Комбо Сайтамы: вкл [F8]" else "Комбо Сайтамы: выкл [F8]"
+	ui.confirmButton.Text = if combat.confirmClick then "Умение: клавиша + ЛКМ [F9]" else "Умение: только клавиша [F9]"
 	if not state.enabled then
 		ui.statusLabel.Text = "На паузе"
 	elseif not state.focused then
@@ -485,6 +792,8 @@ local function updateUI()
 		ui.statusLabel.Text = "Пауза: ввод текста"
 	elseif pointerOverUI() then
 		ui.statusLabel.Text = "Пауза: управление панелью"
+	elseif combat.enabled then
+		ui.statusLabel.Text = combat.status
 	elseif state.target then
 		ui.statusLabel.Text = "Цель: " .. cleanText(state.target.DisplayName or state.target.Name)
 	else
@@ -520,6 +829,13 @@ end
 local function update()
 	if state.destroyed then return end
 	local now = os.clock()
+	if state.enabled and combat.heldSlot and now >= combat.keyReleaseAt then
+		if not releaseSkillKey() then
+			combat.enabled = false
+			pause("Skill key release failed; press/release the digit manually.")
+			return
+		end
+	end
 	if state.enabled and state.held and now >= state.releaseAt then
 		if not releaseMouse() then
 			pause("Input release failed. Click/release LMB manually; see console.")
@@ -551,6 +867,7 @@ local function update()
 		end
 	end
 	if not target then
+		if combat.active then cancelCombat("Поиск противника") end
 		releaseMouse()
 		stopMovement()
 		return
@@ -567,26 +884,12 @@ local function update()
 	if distance > 0.01 then
 		own.root.CFrame = CFrame.lookAt(own.root.Position, own.root.Position + flat)
 	end
+	if stepCombat(own, target, now, offset.Magnitude) then return end
 	if offset.Magnitude > Config.AttackDistance then
 		releaseMouse()
 		return
 	end
-	if not state.held and now >= state.nextClick then
-		local sender = sendButton
-		if not sender then
-			pause("No mouse-input backend. This Xeno build is not supported by this version.")
-			return
-		end
-		-- Mark before calling: even a partially failed down event needs cleanup.
-		state.held = true
-		local ok, reason = pcall(sender, true)
-		if not ok then
-			pause("Input rejected: " .. tostring(reason))
-			return
-		end
-		state.releaseAt = now + Config.ClickHold
-		state.nextClick = now + Config.ClickInterval
-	end
+	pressM1(now)
 end
 
 table.insert(connections, Input.WindowFocused:Connect(function() state.focused = true end))
@@ -604,6 +907,8 @@ table.insert(connections, Input.InputBegan:Connect(function(input, processed)
 		return
 	end
 	if processed or Input:GetFocusedTextBox() then return end
+	if input.KeyCode == Config.ComboKey then toggleCombos(); return end
+	if input.KeyCode == Config.ConfirmKey then toggleConfirmation(); return end
 	if input.KeyCode == Config.ReportKey then
 		showReport()
 		return
@@ -651,5 +956,5 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 		warn("[TSB Bot] GUI stopped; keyboard controls remain available: " .. tostring(reason))
 	end
 end))
-notify("Loaded v0.3, paused. F6: enable; F7: fighter report; End: unload. Input: " .. backend)
+notify("Loaded v0.4, paused. F6: bot; F7: report; F8: combos; F9: skill click. Input: " .. backend)
 
