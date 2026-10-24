@@ -3,7 +3,7 @@
 ## Быстрый запуск в Xeno
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/Probothotspot/TSB-Bot/master/main.lua?v=0.7.1"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Probothotspot/TSB-Bot/2cc219018b9e538a6156eb52235c3b4eb8991b7f/main.lua"))()
 ```
 
 Для способностей используется только подтверждённый VirtualInputManager:SendKeyEvent.
