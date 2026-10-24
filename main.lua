@@ -1,6 +1,6 @@
 --!strict
 -- The Strongest Battlegrounds: M1 and optional normal-form Saitama combos.
--- F6: bot. F7: report. F8: combos. F9: skill click confirmation. End: unload.
+-- F6: bot. F7: report. F8: combos. F9: skill click. F10: targets. End: unload.
 -- No downloaded code or game-specific remote payloads.
 
 local Config = {
@@ -16,6 +16,7 @@ local Config = {
 	ReportKey = Enum.KeyCode.F7,
 	ComboKey = Enum.KeyCode.F8,
 	ConfirmKey = Enum.KeyCode.F9,
+	TargetsKey = Enum.KeyCode.F10,
 	UnloadKey = Enum.KeyCode.End,
 	ComboResetDelay = 1.1,
 	ComboRetryDelay = 0.9,
@@ -132,11 +133,13 @@ local combat: { [string]: any } = {
 }
 
 type Rig = { model: Model, human: Humanoid, root: BasePart }
+type CombatTarget = Player | Model
 local state = {
 	enabled = false,
 	destroyed = false,
 	focused = false,
-	target = nil :: Player?,
+	target = nil :: CombatTarget?,
+	targetMode = "all",
 	held = false,
 	releaseAt = 0,
 	nextClick = 0,
@@ -144,6 +147,37 @@ local state = {
 	drivenHuman = nil :: Humanoid?,
 }
 local connections: { RBXScriptConnection } = {}
+local dummyTargets: { [Model]: boolean } = setmetatable({}, { __mode = "k" })
+
+local function isDummy(model: Model): boolean
+	local function matches(value: string): boolean
+		local name = value:lower():gsub("[^%w]", "")
+		return name == "weakestdummy" or name == "weakerstdammy" or name == "weakestdammy"
+	end
+	if matches(model.Name) then return true end
+	local human = model:FindFirstChildOfClass("Humanoid")
+	return human ~= nil and matches(human.DisplayName)
+end
+
+local function rememberDummy(object: Instance)
+	local ancestor: Instance? = object
+	while ancestor and ancestor ~= Workspace do
+		if ancestor:IsA("Model") and isDummy(ancestor) then
+			dummyTargets[ancestor] = true
+			return
+		end
+		ancestor = ancestor.Parent
+	end
+end
+
+local function targetName(candidate: CombatTarget?): string
+	if not candidate then return "none" end
+	if candidate:IsA("Player") then return candidate.DisplayName .. " [player]" end
+	local human = candidate:FindFirstChildOfClass("Humanoid")
+	local name = if human and human.DisplayName ~= "" then human.DisplayName else candidate.Name
+	return name .. " [NPC]"
+end
+
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 local ui: { [string]: any } = { connections = {}, root = nil, panel = nil, dragging = false, x = 16, y = 90 }
@@ -276,12 +310,14 @@ end
 local function fighterReport(): string
 	local snapshot = sampleFighter()
 	local lines = {
-		"TSB Bot fighter report v0.4.0",
+		"TSB Bot fighter report v0.5.0",
 		"PlaceId: " .. tostring(game.PlaceId),
 		"Status: " .. snapshot.status,
 		"Active ID: " .. cleanText(snapshot.activeId or "unknown"),
 		"Selected ID: " .. cleanText(snapshot.selectedId or "unknown"),
 		"Source: " .. (snapshot.source or "none"),
+		"Target mode: " .. state.targetMode,
+		"Current target: " .. cleanText(targetName(state.target)),
 		"M1 input: " .. backend,
 		"Skill input: " .. skillBackend,
 		"Combo enabled: " .. tostring(combat.enabled),
@@ -303,6 +339,12 @@ local function fighterReport(): string
 	end
 	appendAttributes("Player attributes", snapshot.playerAttributes)
 	appendAttributes("Character attributes", snapshot.characterAttributes)
+	local dummyNames: { string } = {}
+	for model in dummyTargets do
+		if model:IsDescendantOf(Workspace) then table.insert(dummyNames, model.Name) end
+	end
+	table.sort(dummyNames)
+	table.insert(lines, "Detected training NPCs: " .. cleanText(table.concat(dummyNames, " | ")))
 	local function appendTools(container: Instance?)
 		if not container then return end
 		for _, object in container:GetChildren() do
@@ -317,11 +359,11 @@ local function fighterReport(): string
 	return table.concat(lines, "\n")
 end
 
-local function getRig(candidate: Player): Rig?
-	local model = candidate.Character
+local function getRig(candidate: CombatTarget): Rig?
+	local model = if candidate:IsA("Player") then candidate.Character else candidate
 	if not model or not model:IsDescendantOf(Workspace) then return nil end
 	local human = model:FindFirstChildOfClass("Humanoid")
-	local root = model:FindFirstChild("HumanoidRootPart")
+	local root = model:FindFirstChild("HumanoidRootPart") or (human and human.RootPart)
 	if not human or human.Health <= 0 or not root or not root:IsA("BasePart") then return nil end
 	return { model = model, human = human, root = root }
 end
@@ -402,6 +444,7 @@ function controller.GetCombatState()
 		index = combat.index, heldSlot = combat.heldSlot,
 		confirmClick = combat.confirmClick, keyAttempts = combat.keyAttempts,
 		lastAttempt = combat.lastAttempt, nextUse = table.clone(combat.nextUse),
+		targetMode = state.targetMode, targetName = targetName(state.target),
 	}
 end
 
@@ -412,6 +455,7 @@ function controller.Destroy()
 	RunService:UnbindFromRenderStep(bindName)
 	for _, connection in connections do connection:Disconnect() end
 	table.clear(connections)
+	table.clear(dummyTargets)
 	destroyUI()
 	suspend()
 	-- A transient backend error gets one immediate retry during unload.
@@ -459,6 +503,18 @@ local function toggleConfirmation()
 	end
 	combat.confirmClick = not combat.confirmClick
 	notify(if combat.confirmClick then "Skill activation: number key, then LMB." else "Skill activation: number key only. Use Auto Activate in game.")
+end
+
+local function toggleTargets()
+	suspend()
+	if state.targetMode == "all" then
+		state.targetMode = "dummy"
+	elseif state.targetMode == "dummy" then
+		state.targetMode = "players"
+	else
+		state.targetMode = "all"
+	end
+	notify("Targets: " .. state.targetMode .. ". F10: change.")
 end
 
 local function showReport()
@@ -639,10 +695,10 @@ end
 local function layoutUI()
 	local available = ui.container.AbsoluteSize
 	if available.X <= 0 or available.Y <= 0 then return end
-	local scale = math.max(0.1, math.min(1, (available.X - 24) / 292, (available.Y - 24) / 356))
+	local scale = math.max(0.1, math.min(1, (available.X - 24) / 292, (available.Y - 24) / 408))
 	ui.scale.Scale = scale
 	ui.x = math.clamp(ui.x, 8, math.max(8, available.X - 292 * scale - 8))
-	ui.y = math.clamp(ui.y, 8, math.max(8, available.Y - 356 * scale - 8))
+	ui.y = math.clamp(ui.y, 8, math.max(8, available.Y - 408 * scale - 8))
 	ui.panel.Position = UDim2.fromOffset(ui.x, ui.y)
 end
 
@@ -667,7 +723,7 @@ local function createUI()
 	local panel = Instance.new("Frame")
 	ui.panel = panel
 	panel.Name = "Panel"
-	panel.Size = UDim2.fromOffset(292, 356)
+	panel.Size = UDim2.fromOffset(292, 408)
 	panel.Position = UDim2.fromOffset(ui.x, ui.y)
 	panel.BackgroundColor3 = Color3.fromRGB(18, 22, 30)
 	panel.BorderSizePixel = 0
@@ -698,13 +754,13 @@ local function createUI()
 		object.Parent = panel
 		return object
 	end
-	local header = label("Header", "TSB BOT  /  v0.4", 0, 36, 15, false)
+	local header = label("Header", "TSB BOT  /  v0.5", 0, 36, 15, false)
 	header.Size = UDim2.new(1, -64, 0, 36)
 	header.Active = true
 	ui.fighterLabel = label("Fighter", "Боец: определяем...", 44, 26, 15, false)
 	ui.hintLabel = label("Hint", "Отчёт поможет проверить бойца", 72, 18, 12, true)
 	ui.statusLabel = label("Status", "На паузе", 98, 20, 13, false)
-	label("Shortcuts", "F6: бот  F7: отчёт  F8: комбо  F9: ЛКМ", 334, 16, 10, true)
+	label("Shortcuts", "F6: бот  F7: отчёт  F8/F9: бой  F10: цели", 386, 16, 10, true)
 	local function button(name: string, text: string, y: number): TextButton
 		local object = Instance.new("TextButton")
 		object.Name = name
@@ -723,9 +779,10 @@ local function createUI()
 		return object
 	end
 	ui.toggleButton = button("Toggle", "Включить бота", 126)
-	ui.comboButton = button("Combos", "Комбо Сайтамы: выкл [F8]", 178)
-	ui.confirmButton = button("Confirmation", "Умение: только клавиша [F9]", 230)
-	local reportButton = button("Report", "Отчёт о бойце [F7]", 282)
+	ui.targetsButton = button("Targets", "Цели: игроки + манекен [F10]", 178)
+	ui.comboButton = button("Combos", "Комбо Сайтамы: выкл [F8]", 230)
+	ui.confirmButton = button("Confirmation", "Умение: только клавиша [F9]", 282)
+	local reportButton = button("Report", "Отчёт о бойце [F7]", 334)
 	local close = button("Close", "X", 2)
 	close.Size = UDim2.fromOffset(36, 32)
 	close.Position = UDim2.new(1, -40, 0, 2)
@@ -733,6 +790,7 @@ local function createUI()
 		table.insert(ui.connections, event:Connect(callback))
 	end
 	connect(ui.toggleButton.Activated, toggleBot)
+	connect(ui.targetsButton.Activated, toggleTargets)
 	connect(ui.comboButton.Activated, toggleCombos)
 	connect(ui.confirmButton.Activated, toggleConfirmation)
 	connect(reportButton.Activated, showReport)
@@ -784,6 +842,8 @@ local function updateUI()
 	ui.toggleButton.BackgroundColor3 = if state.enabled then Color3.fromRGB(160, 61, 73) else Color3.fromRGB(35, 142, 102)
 	ui.comboButton.Text = if combat.enabled then "Комбо Сайтамы: вкл [F8]" else "Комбо Сайтамы: выкл [F8]"
 	ui.confirmButton.Text = if combat.confirmClick then "Умение: клавиша + ЛКМ [F9]" else "Умение: только клавиша [F9]"
+	local targetsLabel = if state.targetMode == "dummy" then "только манекен" elseif state.targetMode == "players" then "только игроки" else "игроки + манекен"
+	ui.targetsButton.Text = "Цели: " .. targetsLabel .. " [F10]"
 	if not state.enabled then
 		ui.statusLabel.Text = "На паузе"
 	elseif not state.focused then
@@ -795,16 +855,21 @@ local function updateUI()
 	elseif combat.enabled then
 		ui.statusLabel.Text = combat.status
 	elseif state.target then
-		ui.statusLabel.Text = "Цель: " .. cleanText(state.target.DisplayName or state.target.Name)
+		ui.statusLabel.Text = "Цель: " .. cleanText(targetName(state.target))
 	else
 		ui.statusLabel.Text = "Поиск противника"
 	end
 end
 
-local function targetRig(candidate: Player?, own: Rig, radius: number): Rig?
-	if not candidate or candidate == player or candidate.Parent ~= Players then return nil end
+local function targetRig(candidate: CombatTarget?, own: Rig, radius: number): Rig?
+	if not candidate or candidate == player then return nil end
+	if candidate:IsA("Player") then
+		if state.targetMode == "dummy" or candidate.Parent ~= Players then return nil end
+	else
+		if state.targetMode == "players" or not isDummy(candidate) or Players:GetPlayerFromCharacter(candidate) then return nil end
+	end
 	local rig = getRig(candidate)
-	if not rig or rig.model:FindFirstChildOfClass("ForceField") then return nil end
+	if not rig or rig.model == own.model or rig.model:FindFirstChildOfClass("ForceField") then return nil end
 	local offset = rig.root.Position - own.root.Position
 	if offset.Magnitude > radius or math.abs(offset.Y) > Config.MaxHeightDifference then return nil end
 	rayParams.FilterDescendantsInstances = { own.model }
@@ -813,15 +878,21 @@ local function targetRig(candidate: Player?, own: Rig, radius: number): Rig?
 	return rig
 end
 
-local function acquire(own: Rig): Player?
-	local nearest: Player? = nil
+local function acquire(own: Rig): CombatTarget?
+	local nearest: CombatTarget? = nil
 	local distance = Config.AcquireRadius
-	for _, candidate in Players:GetPlayers() do
+	local function consider(candidate: CombatTarget)
 		local rig = targetRig(candidate, own, distance)
 		if rig then
 			nearest = candidate
 			distance = (rig.root.Position - own.root.Position).Magnitude
 		end
+	end
+	if state.targetMode ~= "dummy" then
+		for _, candidate in Players:GetPlayers() do consider(candidate) end
+	end
+	if state.targetMode ~= "players" then
+		for model in dummyTargets do consider(model) end
 	end
 	return nearest
 end
@@ -907,6 +978,7 @@ table.insert(connections, Input.InputBegan:Connect(function(input, processed)
 		return
 	end
 	if processed or Input:GetFocusedTextBox() then return end
+	if input.KeyCode == Config.TargetsKey then toggleTargets(); return end
 	if input.KeyCode == Config.ComboKey then toggleCombos(); return end
 	if input.KeyCode == Config.ConfirmKey then toggleConfirmation(); return end
 	if input.KeyCode == Config.ReportKey then
@@ -919,6 +991,11 @@ table.insert(connections, Input.InputBegan:Connect(function(input, processed)
 end))
 
 registry[registryKey] = controller
+table.insert(connections, Workspace.DescendantAdded:Connect(rememberDummy))
+table.insert(connections, Workspace.DescendantRemoving:Connect(function(object)
+	if object:IsA("Model") then dummyTargets[object] = nil end
+end))
+for _, object in Workspace:GetDescendants() do rememberDummy(object) end
 local bound, bindError = pcall(function()
 	RunService:BindToRenderStep(bindName, Enum.RenderPriority.Character.Value + 1, function()
 		local ok, reason = pcall(update)
@@ -956,5 +1033,5 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 		warn("[TSB Bot] GUI stopped; keyboard controls remain available: " .. tostring(reason))
 	end
 end))
-notify("Loaded v0.4, paused. F6: bot; F7: report; F8: combos; F9: skill click. Input: " .. backend)
+notify("Loaded v0.5, paused. F6: bot; F7: report; F8: combos; F9: click; F10: targets. Input: " .. backend)
 
