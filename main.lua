@@ -1,6 +1,6 @@
 --!strict
 -- The Strongest Battlegrounds: nearest visible player, approach, M1 input.
--- F6: enable/pause. End: unload. Starts paused.
+-- F6: enable/pause. F7: fighter report. End: unload. Starts paused.
 -- No downloaded code or game-specific remote payloads.
 
 local Config = {
@@ -13,6 +13,7 @@ local Config = {
 	ClickHold = 0.06,
 	ScanInterval = 0.2,
 	ToggleKey = Enum.KeyCode.F6,
+	ReportKey = Enum.KeyCode.F7,
 	UnloadKey = Enum.KeyCode.End,
 }
 
@@ -86,6 +87,139 @@ local connections: { RBXScriptConnection } = {}
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 
+-- Identity comes from replicated data, never the avatar's name/appearance.
+-- Attribute names are candidates, not a verified contract with the current TSB build.
+-- A Player-only ID is explicitly a selection hint, not a confirmed active fighter.
+type FighterSnapshot = {
+	activeId: string?,
+	selectedId: string?,
+	source: string?,
+	status: string,
+	abilities: { string },
+	playerAttributes: { [string]: any },
+	characterAttributes: { [string]: any },
+}
+local fighter = {
+	identityKeys = { "Character", "CharacterName", "Fighter", "FighterId", "Moveset", "MovesetName" },
+	nextSample = 0,
+	lastSummary = "",
+	failed = false,
+	snapshot = {
+		activeId = nil,
+		selectedId = nil,
+		source = nil,
+		status = "waiting",
+		abilities = {},
+		playerAttributes = {},
+		characterAttributes = {},
+	} :: FighterSnapshot,
+}
+
+local function cleanText(value: any): string
+	return (tostring(value):gsub("%c", " "))
+end
+
+local function identityFrom(attributes: { [string]: any }): (string?, string?)
+	for _, key in fighter.identityKeys do
+		local value = attributes[key]
+		if type(value) == "string" and value:match("%S") then
+			return value, key
+		end
+	end
+	return nil, nil
+end
+
+local function sampleFighter(): FighterSnapshot
+	local model = player.Character
+	if model and not model:IsDescendantOf(Workspace) then model = nil end
+	local playerAttributes = player:GetAttributes()
+	local characterAttributes = if model then model:GetAttributes() else {}
+	local activeId, activeKey = identityFrom(characterAttributes)
+	local selectedId, selectedKey = identityFrom(playerAttributes)
+	if not selectedId then
+		local selected = playerAttributes.SelectedCharacter
+		if type(selected) == "string" and selected:match("%S") then
+			selectedId, selectedKey = selected, "SelectedCharacter"
+		end
+	end
+	local abilities: { string } = {}
+	local seen: { [string]: boolean } = {}
+	local function collect(container: Instance?)
+		if not container then return end
+		for _, child in container:GetChildren() do
+			if child:IsA("Tool") and not seen[child.Name] then
+				seen[child.Name] = true
+				table.insert(abilities, child.Name)
+			end
+		end
+	end
+	-- During respawn the Backpack can still contain the previous kit.
+	if model then
+		collect(player:FindFirstChildOfClass("Backpack"))
+		collect(model)
+	end
+	table.sort(abilities)
+	local status = "unknown"
+	local source: string? = nil
+	if not model then
+		status = "waiting_for_character"
+	elseif activeId then
+		status = "character_attribute"
+		source = "Character." .. (activeKey or "")
+	elseif selectedId then
+		status = "selection_only"
+		source = "Player." .. (selectedKey or "")
+	end
+	local snapshot: FighterSnapshot = {
+		activeId = if model then activeId else nil,
+		selectedId = selectedId,
+		source = source,
+		status = status,
+		abilities = abilities,
+		playerAttributes = playerAttributes,
+		characterAttributes = characterAttributes,
+	}
+	fighter.snapshot = snapshot
+	return snapshot
+end
+
+local function fighterSummary(snapshot: FighterSnapshot): string
+	if snapshot.status == "waiting_for_character" then return "Fighter: waiting for respawn." end
+	if snapshot.activeId then
+		return "Fighter ID: " .. cleanText(snapshot.activeId) .. " [" .. (snapshot.source or "") .. "]"
+	end
+	if snapshot.selectedId then
+		return "Selected ID: " .. cleanText(snapshot.selectedId) .. "; active fighter unconfirmed. F7: report."
+	end
+	return "Fighter ID unknown. F7: report with attributes and tool names."
+end
+
+local function fighterReport(): string
+	local snapshot = sampleFighter()
+	local lines = {
+		"TSB Bot fighter report v0.2.0",
+		"PlaceId: " .. tostring(game.PlaceId),
+		"Status: " .. snapshot.status,
+		"Active ID: " .. cleanText(snapshot.activeId or "unknown"),
+		"Selected ID: " .. cleanText(snapshot.selectedId or "unknown"),
+		"Source: " .. (snapshot.source or "none"),
+		"Tool names (not slot bindings): " .. cleanText(table.concat(snapshot.abilities, " | ")),
+	}
+	local function appendAttributes(label: string, attributes: { [string]: any })
+		table.insert(lines, label .. ":")
+		local keys: { string } = {}
+		for key in attributes do table.insert(keys, key) end
+		table.sort(keys)
+		if #keys == 0 then table.insert(lines, "  (none)") end
+		for _, key in keys do
+			table.insert(lines, "  " .. cleanText(key) .. " = " .. cleanText(attributes[key]))
+		end
+	end
+	appendAttributes("Player attributes", snapshot.playerAttributes)
+	appendAttributes("Character attributes", snapshot.characterAttributes)
+	return table.concat(lines, "\n")
+end
+
 local function getRig(candidate: Player): Rig?
 	local model = candidate.Character
 	if not model or not model:IsDescendantOf(Workspace) then return nil end
@@ -130,6 +264,15 @@ local function pause(reason: string)
 end
 
 local controller = {}
+function controller.GetFighterState(): FighterSnapshot
+	local snapshot = sampleFighter()
+	local result = table.clone(snapshot)
+	result.abilities = table.clone(snapshot.abilities)
+	result.playerAttributes = table.clone(snapshot.playerAttributes)
+	result.characterAttributes = table.clone(snapshot.characterAttributes)
+	return result
+end
+
 function controller.Destroy()
 	if state.destroyed then return end
 	state.destroyed = true
@@ -250,6 +393,20 @@ table.insert(connections, Input.InputBegan:Connect(function(input, processed)
 		return
 	end
 	if processed or Input:GetFocusedTextBox() then return end
+	if input.KeyCode == Config.ReportKey then
+		local ok, report = pcall(fighterReport)
+		if not ok then
+			notify("Fighter report failed: " .. tostring(report))
+			return
+		end
+		print(report)
+		local copied = false
+		if type(external.setclipboard) == "function" then
+			copied = pcall(external.setclipboard, report)
+		end
+		notify(if copied then "Fighter report copied and printed." else "Fighter report printed to console.")
+		return
+	end
 	if input.KeyCode == Config.ToggleKey then
 		if state.enabled then
 			pause("Paused.")
@@ -277,5 +434,20 @@ if not bound then
 	controller.Destroy()
 	error("TSB Bot: cannot install movement callback: " .. tostring(bindError))
 end
-notify("Loaded, paused. F6: enable; End: unload. Input: " .. backend)
+table.insert(connections, RunService.Heartbeat:Connect(function()
+	if state.destroyed or fighter.failed or os.clock() < fighter.nextSample then return end
+	fighter.nextSample = os.clock() + 0.5
+	local ok, snapshot = pcall(sampleFighter)
+	if not ok then
+		fighter.failed = true
+		warn("[TSB Bot] Fighter detector stopped; M1 remains available: " .. tostring(snapshot))
+		return
+	end
+	local summary = fighterSummary(snapshot)
+	if summary ~= fighter.lastSummary then
+		fighter.lastSummary = summary
+		notify(summary)
+	end
+end))
+notify("Loaded v0.2, paused. F6: enable; F7: fighter report; End: unload. Input: " .. backend)
 
