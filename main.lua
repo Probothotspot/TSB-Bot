@@ -1,5 +1,5 @@
 --!strict
--- The Strongest Battlegrounds: M1 and optional normal-form Saitama combos.
+-- The Strongest Battlegrounds: M1 and cooldown-aware normal-form Saitama skills.
 -- F6: bot. F7: report. F8: combos. F9: skill click. F10: targets. End: unload.
 -- No downloaded code or game-specific remote payloads.
 
@@ -21,9 +21,7 @@ local Config = {
 	ConfirmKey = Enum.KeyCode.F9,
 	TargetsKey = Enum.KeyCode.F10,
 	UnloadKey = Enum.KeyCode.End,
-	ComboResetDelay = 0.2,
 	ComboRetryDelay = 0.9,
-	ComboWaitLimit = 0.9,
 	SkillKeyHold = 0.12,
 	KeyReceiptTimeout = 0.4,
 }
@@ -132,40 +130,24 @@ if #keyboard.backends > 0 then
 	end
 end
 
--- These are local retry limits and starter timings, not measured server cooldowns.
+-- Readiness comes from the actual hotbar. Recovery delays only pace accepted input.
 local saitama = {
+	slotNames = { "Normal Punch", "Consecutive Punches", "Shove", "Uppercut" },
+	priority = { 2, 3, 1 },
 	skills = {
-		["Normal Punch"] = { slot = 1, retry = 12, range = 6 },
-		["Consecutive Punches"] = { slot = 2, retry = 14, range = 5 },
-		["Shove"] = { slot = 3, retry = 12, range = 5 },
-		["Uppercut"] = { slot = 4, retry = 14, range = 5 },
-	},
-	plans = {
-		{
-			name = "2 > 3M1 > 4 > 1",
-			steps = {
-				{ kind = "skill", skill = "Consecutive Punches", delay = 1.9 },
-				{ kind = "m1", delay = 0.48 }, { kind = "m1", delay = 0.48 }, { kind = "m1", delay = 0.48 },
-				{ kind = "skill", skill = "Uppercut", delay = 0.95 },
-				{ kind = "skill", skill = "Normal Punch", delay = 1.0 },
-			},
-		},
-		{
-			name = "3 > 3M1 > 1",
-			steps = {
-				{ kind = "skill", skill = "Shove", delay = 0.65 },
-				{ kind = "m1", delay = 0.48 }, { kind = "m1", delay = 0.48 }, { kind = "m1", delay = 0.48 },
-				{ kind = "skill", skill = "Normal Punch", delay = 1.0 },
-			},
-		},
+		["Normal Punch"] = { slot = 1, recovery = 1.0, range = 6 },
+		["Consecutive Punches"] = { slot = 2, recovery = 1.9, range = 5 },
+		["Shove"] = { slot = 3, recovery = 0.65, range = 5 },
+		["Uppercut"] = { slot = 4, recovery = 0.95, range = 5 },
 	},
 }
 local combat: { [string]: any } = {
 	enabled = Config.AutoCombos, confirmClick = Config.ConfirmSkillClick, active = false, owner = nil, target = nil,
-	plan = nil, index = 1, due = 0, nextStart = 0, routeCursor = 1,
-	heldSlot = nil, keyReleaseAt = 0, confirmAt = nil, waitUntil = nil,
-	nextUse = {}, status = "Готов к бою", lastAttempt = "none", keyAttempts = 0,
-	m1Count = 0, cancelReason = "none", cancelled = 0,
+	index = 1, due = 0, nextStart = 0,
+	heldSlot = nil, keyReleaseAt = 0, confirmAt = nil,
+	retryAt = {}, status = "Готов к бою", lastAttempt = "none", keyAttempts = 0,
+	cancelReason = "none", cancelled = 0,
+	prone = false, proneSource = "not sampled", confirmRange = Config.AttackDistance,
 }
 
 type Rig = { model: Model, human: Humanoid, root: BasePart }
@@ -350,10 +332,56 @@ local function fighterSummary(snapshot: FighterSnapshot): string
 	return "Fighter ID unknown. F7: report with attributes and tool names."
 end
 
+type CooldownReading = { ready: boolean?, fraction: number?, source: string, reason: string }
+local function readCooldown(slot: number): CooldownReading
+	local parent = player:FindFirstChildOfClass("PlayerGui")
+	local hotbar = parent and parent:FindFirstChild("Hotbar")
+	local backpack = hotbar and hotbar:FindFirstChild("Backpack")
+	local slots = backpack and backpack:FindFirstChild("Hotbar")
+	local item = slots and slots:FindFirstChild(tostring(slot))
+	local base = item and item:FindFirstChild("Base")
+	local source = "Hotbar.Backpack.Hotbar." .. tostring(slot) .. ".Base"
+	if not base or not base:IsA("GuiObject") then
+		return { ready = nil, fraction = nil, source = source, reason = "missing live slot" }
+	end
+	local label = base:FindFirstChild("ToolName")
+	if not label or not label:IsA("TextLabel") or label.Text ~= saitama.slotNames[slot] then
+		return { ready = nil, fraction = nil, source = source, reason = "skill label mismatch" }
+	end
+	local cooldown = base:FindFirstChild("Cooldown")
+	if not cooldown then
+		return { ready = true, fraction = 0, source = source .. ".Cooldown", reason = "overlay absent" }
+	end
+	if not cooldown:IsA("GuiObject") then
+		return { ready = nil, fraction = nil, source = source .. ".Cooldown", reason = "unexpected cooldown class" }
+	end
+	local height = cooldown.Size.Y.Scale
+	local offset = cooldown.Size.Y.Offset
+	if offset ~= 0 then
+		if base.AbsoluteSize.Y <= 0 then
+			return { ready = nil, fraction = nil, source = source .. ".Cooldown", reason = "slot not measured" }
+		end
+		height += offset / base.AbsoluteSize.Y
+	end
+	-- TSB draws its active overlay UPWARDS: the observed Y.Scale was -0.776453793.
+	local fraction = math.abs(height)
+	if fraction ~= fraction or fraction == math.huge then
+		return { ready = nil, fraction = nil, source = source .. ".Cooldown", reason = "invalid height" }
+	end
+	return { ready = fraction <= 0.0001, fraction = fraction, source = source .. ".Cooldown", reason = "live overlay height" }
+end
+
+local function cooldownText(slot: number, reading: CooldownReading): string
+	local value = "?"
+	if reading.ready == true then value = "готов" end
+	if reading.ready == false then value = "КД" end
+	return tostring(slot) .. ":" .. value
+end
+
 local function fighterReport(): string
 	local snapshot = sampleFighter()
 	local lines = {
-		"TSB Bot fighter report v0.7.1",
+		"TSB Bot fighter report v0.8.0",
 		"PlaceId: " .. tostring(game.PlaceId),
 		"Status: " .. snapshot.status,
 		"Active ID: " .. cleanText(snapshot.activeId or "unknown"),
@@ -378,6 +406,7 @@ local function fighterReport(): string
 		"Combo cancellations: " .. tostring(combat.cancelled),
 		"Last skill input attempt: " .. cleanText(combat.lastAttempt),
 		"Skill input attempts: " .. tostring(combat.keyAttempts),
+		"Target prone: " .. tostring(combat.prone) .. " [" .. combat.proneSource .. "]",
 		"Tool names (not slot bindings): " .. cleanText(table.concat(snapshot.abilities, " | ")),
 	}
 	local function appendAttributes(label: string, attributes: { [string]: any })
@@ -392,6 +421,11 @@ local function fighterReport(): string
 	end
 	appendAttributes("Player attributes", snapshot.playerAttributes)
 	appendAttributes("Character attributes", snapshot.characterAttributes)
+	for slot = 1, 4 do
+		local reading = readCooldown(slot)
+		table.insert(lines, "Cooldown " .. tostring(slot) .. ": ready=" .. tostring(reading.ready)
+			.. " fraction=" .. tostring(reading.fraction) .. " source=" .. reading.source .. " reason=" .. reading.reason)
+	end
 	local dummyNames: { string } = {}
 	for model in dummyTargets do
 		if model:IsDescendantOf(Workspace) then table.insert(dummyNames, model.Name) end
@@ -455,8 +489,8 @@ local function cancelCombat(reason: string): boolean
 		combat.cancelReason = reason
 		combat.cancelled += 1
 	end
-	combat.active, combat.plan, combat.target = false, nil, nil
-	combat.confirmAt, combat.waitUntil = nil, nil
+	combat.active, combat.target = false, nil
+	combat.confirmAt = nil
 	keyboard.pending = nil
 	combat.index = 1
 	combat.nextStart = os.clock() + Config.ComboRetryDelay
@@ -502,7 +536,9 @@ function controller.GetCombatState()
 		enabled = combat.enabled, active = combat.active, status = combat.status,
 		index = combat.index, heldSlot = combat.heldSlot,
 		confirmClick = combat.confirmClick, keyAttempts = combat.keyAttempts,
-		lastAttempt = combat.lastAttempt, nextUse = table.clone(combat.nextUse),
+		lastAttempt = combat.lastAttempt, inputRetryAt = table.clone(combat.retryAt),
+		cooldowns = { readCooldown(1), readCooldown(2), readCooldown(3), readCooldown(4) },
+		targetProne = combat.prone, proneSource = combat.proneSource,
 		keyReceipts = keyboard.received, keyboardCalls = keyboard.calls, keyboardError = keyboard.lastError,
 		keyboardBackend = skillBackend,
 		targetMode = state.targetMode, targetName = targetName(state.target),
@@ -631,25 +667,42 @@ local function skillTools(model: Model): { [string]: any }
 	return tools
 end
 
-local function waitCombat(now: number, reason: string): boolean
-	if not combat.waitUntil then combat.waitUntil = now + Config.ComboWaitLimit end
-	if now >= combat.waitUntil then
-		cancelCombat(reason)
-		return false
+local groundParams = RaycastParams.new()
+groundParams.FilterType = Enum.RaycastFilterType.Exclude
+groundParams.IgnoreWater = true
+
+local function targetProne(own: Rig, target: Rig): (boolean, string)
+	local attributes = target.model:GetAttributes()
+	local flag: string? = nil
+	for _, name in { "Ragdoll", "Ragdolled", "Downed" } do
+		if attributes[name] == true then flag = name; break end
 	end
-	combat.status = reason
-	combat.due = now + 0.05
-	return true
+	local human = target.human
+	local stateName = human:GetState()
+	local torso = target.model:FindFirstChild("Torso") or target.model:FindFirstChild("UpperTorso") or target.root
+	local horizontal = torso:IsA("BasePart") and math.abs(torso.CFrame.UpVector.Y) < 0.55
+	local physicsState = stateName == Enum.HumanoidStateType.Ragdoll
+		or stateName == Enum.HumanoidStateType.FallingDown
+		or stateName == Enum.HumanoidStateType.Physics
+		or stateName == Enum.HumanoidStateType.PlatformStanding
+	if not flag and not horizontal and not physicsState and not human.PlatformStand then return false, "upright" end
+	local grounded = human.FloorMaterial ~= Enum.Material.Air
+	if not grounded then
+		groundParams.FilterDescendantsInstances = { own.model, target.model }
+		grounded = Workspace:Raycast(torso.Position, Vector3.new(0, -2.5, 0), groundParams) ~= nil
+	end
+	if not grounded then return false, "airborne" end
+	if flag then return true, "attribute:" .. flag .. " + ground" end
+	return true, if horizontal then "horizontal torso + ground" else "humanoid physics + ground"
 end
 
 local function stepCombat(own: Rig, target: Rig, now: number, distance: number): boolean
+	combat.prone, combat.proneSource = targetProne(own, target)
 	if not combat.enabled then return false end
 	if not sendSkillKey then combat.status = "Умения: нет ввода клавиатуры"; return false end
 	if combat.owner ~= own.model then
 		cancelCombat("Новый персонаж")
-		combat.owner = own.model
-		combat.nextUse = {}
-		combat.nextStart = now
+		combat.owner, combat.retryAt, combat.nextStart, combat.due = own.model, {}, now, 0
 	end
 	local attributes = own.model:GetAttributes()
 	local tools = skillTools(own.model)
@@ -659,7 +712,7 @@ local function stepCombat(own: Rig, target: Rig, now: number, distance: number):
 	if not readyKit then reason = "M1: нужен обычный набор Сайтамы" end
 	if not defaultSkillBindings() then reason = "M1: нужны стандартные кнопки 1–4" end
 	if attributes.Stunned == true or attributes.Ragdolled == true or attributes.Ragdoll == true then
-		reason = "Комбо прервано: оглушение"
+		reason = "Умения прерваны: оглушение"
 	end
 	if reason then
 		if combat.active then cancelCombat(reason) else combat.status = reason end
@@ -669,43 +722,13 @@ local function stepCombat(own: Rig, target: Rig, now: number, distance: number):
 		cancelCombat("Цель сменилась")
 		return true
 	end
-	if not combat.active then
-		if now < combat.nextStart or distance > Config.AttackDistance then return false end
-		local chosen = nil
-		for offset = 0, #saitama.plans - 1 do
-			local candidateIndex = (combat.routeCursor - 1 + offset) % #saitama.plans + 1
-			local candidate = saitama.plans[candidateIndex]
-			local available = true
-			for _, action in candidate.steps do
-				if action.kind == "skill" then
-					local name = action.skill
-					if (combat.nextUse[name] or 0) > now or tools[name].Enabled == false then available = false end
-				end
-			end
-			if available then
-				chosen = candidate
-				combat.routeCursor = candidateIndex % #saitama.plans + 1
-				break
-			end
-		end
-		if not chosen then combat.status = "M1: ожидание умений"; return false end
-		if not releaseMouse() then pause("Mouse release failed before combo."); return true end
-		combat.active, combat.plan, combat.target = true, chosen, target.model
-		combat.index, combat.due = 1, now + Config.ComboResetDelay
-		combat.m1Count = 0
-		combat.waitUntil = nil
-		combat.status = "Подготовка: " .. chosen.name
-		return true
-	end
 	local pending = keyboard.pending
 	if pending then
 		if pending.echoed then
 			keyboard.lastError = "none"
-			local spec = saitama.skills[pending.name]
-			combat.nextUse[pending.name] = now + spec.retry
-			combat.index += 1
+			-- A short input debounce, never a substitute for the live cooldown overlay.
+			combat.retryAt[pending.name] = now + 0.5
 			combat.due = now + pending.delay
-			combat.waitUntil = nil
 			combat.status = "Кнопка получена: " .. pending.name
 			keyboard.pending = nil
 			if combat.confirmClick then combat.confirmAt = math.max(now, combat.keyReleaseAt) + 0.04 end
@@ -723,72 +746,57 @@ local function stepCombat(own: Rig, target: Rig, now: number, distance: number):
 		return true
 	end
 	if combat.confirmAt then
-		if distance > Config.AttackDistance then
-			cancelCombat("Цель ушла перед подтверждением")
-			return true
-		end
-		if now >= combat.confirmAt then
-			if pressM1(now) then combat.confirmAt = nil end
-		end
+		if distance > combat.confirmRange then cancelCombat("Цель ушла перед подтверждением"); return true end
+		if now >= combat.confirmAt and pressM1(now) then combat.confirmAt = nil end
 		return true
 	end
-	if now < combat.due or combat.heldSlot then return true end
-	local plan = combat.plan
-	local action = plan.steps[combat.index]
-	if not action then
-		cancelCombat("Последовательность завершена")
-		return false
+	if combat.active then
+		if now < combat.due or combat.heldSlot then return true end
+		combat.active, combat.target = false, nil
 	end
-	local maxRange = if action.kind == "skill" then saitama.skills[action.skill].range else Config.AttackDistance
-	if distance > maxRange then return waitCombat(now, "Ожидание дистанции") end
-	if action.kind == "m1" then
-		if attributes.M1Ready == false then return waitCombat(now, "Ожидание M1") end
-		if not pressM1(now) then return true end
-		combat.m1Count += 1
-		combat.status = "Комбо: M1 " .. tostring(combat.m1Count) .. "/3"
-	else
-		local name = action.skill
-		local tool = tools[name]
-		if not tool or tool.Enabled == false or (combat.nextUse[name] or 0) > now then
-			return waitCombat(now, "Ожидание: " .. name)
+	if now < combat.nextStart then return false end
+	local function available(slot: number): boolean
+		local name = saitama.slotNames[slot]
+		return tools[name].Enabled ~= false and (combat.retryAt[name] or 0) <= now and readCooldown(slot).ready == true
+	end
+	local chosen: number? = nil
+	if combat.prone and available(4) then chosen = 4 end
+	if not chosen then
+		for _, slot in saitama.priority do
+			if available(slot) then chosen = slot; break end
 		end
-		if not releaseMouse() then pause("Mouse release failed before skill."); return true end
-		local sender = sendSkillKey
-		if not sender then
-			combat.enabled = false
-			cancelCombat("Нет ввода клавиш")
-			return false
-		end
-		local spec = saitama.skills[name]
-		combat.heldSlot = spec.slot
-		combat.keyReleaseAt = now + Config.SkillKeyHold
-		keyboard.pending = { slot = spec.slot, name = name, delay = action.delay, deadline = now + Config.KeyReceiptTimeout, echoed = false }
-		local ok, errorMessage = pcall(sender, spec.slot, true)
-		if not ok then
-			combat.enabled = false
-			local released = cancelCombat("Ошибка ввода умения")
-			notify("Skill input rejected: " .. tostring(errorMessage) .. ". F7: report.")
-			if not released then pause("Skill key release failed; release it manually.") end
-			return true
-		end
-		combat.keyAttempts += 1
-		combat.lastAttempt = name .. " [" .. tostring(spec.slot) .. "]"
-		combat.status = "Ждём кнопку " .. tostring(spec.slot) .. ": " .. name
+	end
+	if not chosen then combat.status = "M1: нет готовых умений (см. КД)"; return false end
+	local name = saitama.slotNames[chosen]
+	local spec = saitama.skills[name]
+	if distance > spec.range then combat.status = "Подходим: " .. name; return false end
+	if not releaseMouse() then pause("Mouse release failed before skill."); return true end
+	combat.active, combat.target, combat.index = true, target.model, chosen
+	combat.confirmRange = spec.range
+	combat.heldSlot = chosen
+	combat.keyReleaseAt = now + Config.SkillKeyHold
+	keyboard.pending = { slot = chosen, name = name, delay = spec.recovery, deadline = now + Config.KeyReceiptTimeout, echoed = false }
+	local ok, errorMessage = pcall(sendSkillKey, chosen, true)
+	if not ok then
+		combat.enabled = false
+		local released = cancelCombat("Ошибка ввода умения")
+		notify("Skill input rejected: " .. tostring(errorMessage) .. ". F7: report.")
+		if not released then pause("Skill key release failed; release it manually.") end
 		return true
 	end
-	combat.waitUntil = nil
-	combat.index += 1
-	combat.due = now + action.delay
+	combat.keyAttempts += 1
+	combat.lastAttempt = name .. " [" .. tostring(chosen) .. "]"
+	combat.status = "Ждём кнопку " .. tostring(chosen) .. ": " .. name
 	return true
 end
 
 local function layoutUI()
 	local available = ui.container.AbsoluteSize
 	if available.X <= 0 or available.Y <= 0 then return end
-	local scale = math.max(0.1, math.min(1, (available.X - 24) / 292, (available.Y - 24) / 408))
+	local scale = math.max(0.1, math.min(1, (available.X - 24) / 292, (available.Y - 24) / 428))
 	ui.scale.Scale = scale
 	ui.x = math.clamp(ui.x, 8, math.max(8, available.X - 292 * scale - 8))
-	ui.y = math.clamp(ui.y, 8, math.max(8, available.Y - 408 * scale - 8))
+	ui.y = math.clamp(ui.y, 8, math.max(8, available.Y - 428 * scale - 8))
 	ui.panel.Position = UDim2.fromOffset(ui.x, ui.y)
 end
 
@@ -813,7 +821,7 @@ local function createUI()
 	local panel = Instance.new("Frame")
 	ui.panel = panel
 	panel.Name = "Panel"
-	panel.Size = UDim2.fromOffset(292, 408)
+	panel.Size = UDim2.fromOffset(292, 428)
 	panel.Position = UDim2.fromOffset(ui.x, ui.y)
 	panel.BackgroundColor3 = Color3.fromRGB(18, 22, 30)
 	panel.BorderSizePixel = 0
@@ -844,13 +852,14 @@ local function createUI()
 		object.Parent = panel
 		return object
 	end
-	local header = label("Header", "TSB BOT  /  v0.7.1", 0, 36, 15, false)
+	local header = label("Header", "TSB BOT  /  v0.8.0", 0, 36, 15, false)
 	header.Size = UDim2.new(1, -64, 0, 36)
 	header.Active = true
 	ui.fighterLabel = label("Fighter", "Боец: определяем...", 44, 26, 15, false)
 	ui.hintLabel = label("Hint", "Отчёт поможет проверить бойца", 72, 18, 12, true)
-	ui.statusLabel = label("Status", "На паузе", 98, 20, 13, false)
-	label("Shortcuts", "F6: бот  F7: отчёт  F8/F9: бой  F10: цели", 386, 16, 10, true)
+	ui.cooldownLabel = label("Cooldowns", "КД: читаем панель…", 98, 18, 12, true)
+	ui.statusLabel = label("Status", "На паузе", 118, 20, 13, false)
+	label("Shortcuts", "F6: бот  F7: отчёт  F8/F9: бой  F10: цели", 406, 16, 10, true)
 	local function button(name: string, text: string, y: number): TextButton
 		local object = Instance.new("TextButton")
 		object.Name = name
@@ -868,11 +877,11 @@ local function createUI()
 		rounded.Parent = object
 		return object
 	end
-	ui.toggleButton = button("Toggle", "Включить бота", 126)
-	ui.targetsButton = button("Targets", "Цели: игроки + манекен [F10]", 178)
-	ui.comboButton = button("Combos", "Комбо Сайтамы: выкл [F8]", 230)
-	ui.confirmButton = button("Confirmation", "Умение: только клавиша [F9]", 282)
-	local reportButton = button("Report", "Отчёт о бойце [F7]", 334)
+	ui.toggleButton = button("Toggle", "Включить бота", 146)
+	ui.targetsButton = button("Targets", "Цели: игроки + манекен [F10]", 198)
+	ui.comboButton = button("Combos", "Умения Сайтамы: выкл [F8]", 250)
+	ui.confirmButton = button("Confirmation", "Умение: только клавиша [F9]", 302)
+	local reportButton = button("Report", "Отчёт о бойце [F7]", 354)
 	local close = button("Close", "X", 2)
 	close.Size = UDim2.fromOffset(36, 32)
 	close.Position = UDim2.new(1, -40, 0, 2)
@@ -928,9 +937,12 @@ local function updateUI()
 		ui.fighterLabel.Text = "Боец: не определён"
 		ui.hintLabel.Text = "Нажми «Отчёт» для проверки"
 	end
+	local cdLabels = {}
+	for slot = 1, 4 do table.insert(cdLabels, cooldownText(slot, readCooldown(slot))) end
+	ui.cooldownLabel.Text = table.concat(cdLabels, "  ")
 	ui.toggleButton.Text = if state.enabled then "Пауза [F6]" else "Включить бота [F6]"
 	ui.toggleButton.BackgroundColor3 = if state.enabled then Color3.fromRGB(160, 61, 73) else Color3.fromRGB(35, 142, 102)
-	ui.comboButton.Text = if combat.enabled then "Комбо Сайтамы: вкл [F8]" else "Комбо Сайтамы: выкл [F8]"
+	ui.comboButton.Text = if combat.enabled then "Умения Сайтамы: вкл [F8]" else "Умения Сайтамы: выкл [F8]"
 	ui.confirmButton.Text = if combat.confirmClick then "Умение: клавиша + ЛКМ [F9]" else "Умение: только клавиша [F9]"
 	local targetsLabel = if state.targetMode == "dummy" then "только манекен" elseif state.targetMode == "players" then "только игроки" else "игроки + манекен"
 	ui.targetsButton.Text = "Цели: " .. targetsLabel .. " [F10]"
@@ -1130,5 +1142,5 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 		warn("[TSB Bot] GUI stopped; keyboard controls remain available: " .. tostring(reason))
 	end
 end))
-notify("Loaded v0.7.1: skill keys use VirtualInputManager only. F6: pause; End: unload.")
+notify("Loaded v0.8.0: live cooldowns; priority 2 > 3 > 1, 4 on prone targets. F6: pause; End: unload.")
 
